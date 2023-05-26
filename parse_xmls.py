@@ -1,7 +1,8 @@
 import os
-import json
+import heapq
 import signal
 import random
+import cchardet
 import psycopg2
 import argparse
 from pathlib import Path
@@ -15,28 +16,59 @@ from utils.qc_roll_mapping import *
 # Read in the database configuration from a .env file
 DB_CONFIG = dotenv_values(".env")
 
-def launch_jobs(input_folder, num_workers):
+def launch_jobs(input_folder: Path, num_workers: int):
 
     # Split the XMLs evenly between the workers
     splits = split_xmls_between_workers(input_folder, num_workers)
 
     # launch a process pool mapping the parsing function and the XMLs
     with Pool(processes=num_workers) as pool:
-        pool.map(parse_xmls, splits)
-        # for _ in pool.imap_unordered(parse_xmls, splits):
-        #     pass
+        # pool.map(parse_xmls, splits)
+        for _ in pool.imap_unordered(parse_xmls, splits):
+            pass
 
-def split_xmls_between_workers(input_folder, num_workers):
 
-    all_files = list(input_folder.iterdir())
+def split_xmls_between_workers(input_folder: Path, num_workers: int):
+    """
+    Partition the XMLs such that each worker has an approximately equal
+    total data size to process. This is because some municipalities (i.e. Montreal)
+    have vastly more data than others, and we want to parallelize as best as possible.
+    """
 
-    # Shuffle the list since they don't have all the same number of items
-    # A better way to do this would be to have counts of items in each file
-    # a split so that each worker gets approximately the same amount of items
-    random.shuffle(all_files)
+    size_per_file = {}
+    for xml_file in input_folder.iterdir():
+        size_per_file[xml_file] = xml_file.stat().st_size
+        
+    # Sort sizes in descending order
+    size_per_file = dict(sorted(size_per_file.items(), key=lambda x: x[1], reverse=True))
     
-    # Some python magic to even split the files
-    return [all_files[i::num_workers] for i in range(num_workers)]
+    # We iterate over the files, starting from the largest 
+    # one and distribute them among workers, always giving 
+    # the current to the worker with the least amount of data.
+    # Using a min heap, we quickly get the worker with the least amount of data.
+    splits = [[] for _ in range(num_workers)]
+    worker_heap = [ [0, worker_id] for worker_id in range(num_workers)]
+    heapq.heapify(worker_heap)
+
+    # Pop a first worker from the heap
+    lowest_worker = heapq.heappop(worker_heap)
+    for file, size in size_per_file.items():
+        # Get the worker's id
+        worker_id = lowest_worker[1]
+        # Add the file to the worker's split
+        splits[worker_id].append(file)
+        # Add the file size to the worker's total size
+        lowest_worker[0] += size
+        # Push back the worker and pop the new lowest
+        lowest_worker = heapq.heappushpop(worker_heap, lowest_worker)
+
+    # Print out results
+    print(f'Worker {lowest_worker[1]} will process: {lowest_worker[0]} B')
+    while worker_heap:
+        worker = heapq.heappop(worker_heap)
+        print(f'Worker {worker[1]} will process: {worker[0]} B')
+
+    return splits
 
 
 def parse_xmls(xml_files):
@@ -44,27 +76,24 @@ def parse_xmls(xml_files):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     # Establish worker DB connection
-    # conn_string = 'postgresql://postgres:Gr33ssp0st44\$\$@localhost:5432/proll'
     conn = psycopg2.connect(user=DB_CONFIG['DB_USER'], password=DB_CONFIG['DB_PASSWORD'], database=DB_CONFIG['DB_NAME'])
     cursor = conn.cursor()
-
-    units_per_muni = {}
 
     total_units = 0
 
     for xml_file in xml_files:
 
-        print(f'{pid}: processing {xml_file}')
+        print(f'{pid}:\tProcessing {xml_file}')
 
-        xml_file = open(xml_file, 'r', encoding='utf-8')
-        content = xml_file.readlines()
+        xml = open(xml_file, 'r', encoding='utf-8')
+        content = xml.readlines()
         content = "".join(content)
         xml = BeautifulSoup(content, 'lxml')
         
         unit_data = {}
 
         # Municipal code is at the top
-        code_muni = xml.find('rlm01a').text
+        muni_code = xml.find('rlm01a').text
 
         year_entered = int(xml.find('rlm02a').text)
 
@@ -74,10 +103,11 @@ def parse_xmls(xml_files):
             # Commit writes every 1000 units
             if i % 1000 == 0 and i > 0:
                 conn.commit()
-                print(f'{pid}:\tOn unit {i}')
+                print(f'{pid}:\t\tOn unit {i}')
 
             unit_data = {}
-            unit_data['muni'] = code_muni
+            unit_data['muni'] = MUNICIPALITIES[f'RL{muni_code}']
+            unit_data['muni_code'] = muni_code
             unit_data['year'] = year_entered
 
             # RL0104 - we'll use it to create the MAT18 and ID_PROVINC used in the GIS data
@@ -85,19 +115,22 @@ def parse_xmls(xml_files):
             rl0104 = unit.find('rl0104')
             mat18 = generate_mat18(rl0104)
             unit_data['mat18'] = mat18
-            unit_data['id'] = code_muni + mat18
+            id = muni_code + mat18
+            unit_data['id'] = id
 
-            cursor.execute("""SELECT """)
+            # Check if the unit already exists in which case, skip to the next one
+            if unit_exists(cursor, id):
+                continue
 
             # RL0101: Unit Identification Fields
             # Every unit must have at least RL0101Gx, so RL0101 will always be present
             # They made so that multiple RL0101x could be present, but in practice there's always a single one
             rl0101x = unit.find('rl0101x')
-            unit_data['address'] = generate_address(rl0101x)
-                        
-            # Keep the apt number separate from the street address 
-            # so we can merge MURBs that are disaggregated into indiviudal units
-            unit_data['apt_num'] = generate_apt_num(rl0101x)
+            get_address_components_and_resolve(rl0101x, unit_data)
+
+            # Keep the apt number separate from the street address
+            # We can use this to merge MURBs that are disaggregated into indiviudal units
+            get_apt_num_components(rl0101x, unit_data)
 
             # RL0102A 
             unit_data['arrond'] = extract_field_or_none(unit, 'rl0102a')
@@ -160,29 +193,37 @@ def parse_xmls(xml_files):
 
             # Write out the current unit to the DB
             cursor.execute(f"""
-                INSERT INTO {DB_CONFIG['TABLE_NAME']} 
-                    (id, year, muni, arrond, address, apt_num, mat18, cubf, file_num, nghbr_unit, owner_date, owner_type, owner_status, lot_lin_dim, lot_area, max_floors, const_yr, const_yr_real, floor_area, phys_link, const_type, num_dwelling, num_rental, num_non_res, apprais_date, lot_value, building_value, value, prev_value)
+                INSERT INTO {DB_CONFIG['ROLL_TABLE_NAME']} 
+                    (id, year, muni, muni_code, arrond, address, num_adr_inf, num_adr_inf_2, num_adr_sup, num_adr_sup_2, 
+                    way_type, way_link, street_name, cardinal_pt, apt_num, apt_num_1, apt_num_2, mat18, cubf, 
+                    file_num, nghbr_unit, owner_date, owner_type, owner_status, lot_lin_dim, lot_area, max_floors, 
+                    const_yr, const_yr_real, floor_area, phys_link, const_type, num_dwelling, num_rental, num_non_res, 
+                    apprais_date, lot_value, building_value, value, prev_value)
                 VALUES 
-                    (%(id)s, %(year)s, %(muni)s, %(arrond)s, %(address)s, %(apt_num)s, %(mat18)s, %(cubf)s, %(file_num)s, %(nghbr_unit)s, %(owner_date)s, %(owner_type)s, %(owner_status)s, %(lot_lin_dim)s, %(lot_area)s, %(max_floors)s, %(const_yr)s, %(const_yr_real)s, %(floor_area)s, %(phys_link)s, %(const_type)s, %(num_dwelling)s, %(num_rental)s, %(num_non_res)s, %(apprais_date)s, %(lot_value)s, %(building_value)s, %(value)s, %(prev_value)s)
+                    (%(id)s, %(year)s, %(muni)s, %(muni_code)s, %(arrond)s, %(address)s, %(num_adr_inf)s, %(num_adr_inf_2)s, 
+                    %(num_adr_sup)s, %(num_adr_sup_2)s, %(way_type)s, %(way_link)s, %(street_name)s, %(cardinal_pt)s, 
+                    %(apt_num)s, %(apt_num_1)s, %(apt_num_2)s, %(mat18)s, %(cubf)s, %(file_num)s, %(nghbr_unit)s, 
+                    %(owner_date)s, %(owner_type)s, %(owner_status)s, %(lot_lin_dim)s, %(lot_area)s, %(max_floors)s, 
+                    %(const_yr)s, %(const_yr_real)s, %(floor_area)s, %(phys_link)s, %(const_type)s, %(num_dwelling)s, 
+                    %(num_rental)s, %(num_non_res)s, %(apprais_date)s, %(lot_value)s, %(building_value)s, %(value)s, 
+                    %(prev_value)s)
                 """, unit_data
             )
 
         # Flush out the current file's units
         conn.commit()
 
-        units_per_muni[code_muni] = i + 1
-
         print(f'{pid}:\tTotal: {i + 1} units')
 
         # Keep count of total number of units seen
         total_units += i + 1
-
-    # Save the number of units per municipality just as extra data
-    with open('output/units_per_muni.json', 'w', encoding='utf-8') as outfile:
-        json.dump(units_per_muni ,outfile)
         
-    print(f'Parsed {total_units} units in total!')
+    print(f'{pid}:\tParsed {total_units} units in total!')
 
+
+def unit_exists(cursor, id):
+    cursor.execute(f"""SELECT EXISTS (SELECT 1 FROM {DB_CONFIG['ROLL_TABLE_NAME']} WHERE id=%s)""", (id,))
+    return cursor.fetchone()[0]
 
 
 def extract_field_or_none(unit_xml, field_id, type=None):
@@ -193,50 +234,87 @@ def extract_field_or_none(unit_xml, field_id, type=None):
         return field
     # else
     return None
+
+def extract_field_or_empty_string(unit_xml, field_id):
+    if field := unit_xml.find(field_id):
+        return field.text
+    return ''
             
 
-def generate_address(rl0101x):
+def get_address_components_and_resolve(rl0101x, unit_data):
+    """Add all address subfields and the fully resolved address to unit_data"""
     address_components = []
 
     if num_adr_inf := rl0101x.find('rl0101ax'):
+        unit_data['num_adr_inf'] = num_adr_inf.text
         address_components.append(num_adr_inf.text)
-
+    else:
+        unit_data['num_adr_inf'] = None
+    
     if num_adr_inf_2 := rl0101x.find('rl0101bx'):
+        unit_data['num_adr_inf_2'] = num_adr_inf_2.text
         address_components.append(num_adr_inf_2.text)
+    else:
+        unit_data['num_adr_inf_2'] = None
 
     if num_adr_sup := rl0101x.find('rl0101cx'):
+        unit_data['num_adr_sup'] = num_adr_sup.text
         address_components.append(num_adr_sup.text)
+    else:
+        unit_data['num_adr_sup'] = None
 
     if num_adr_sup_2 := rl0101x.find('rl0101dx'):
+        unit_data['num_adr_sup_2'] = num_adr_sup_2.text
         address_components.append(num_adr_sup_2.text)
+    else:
+        unit_data['num_adr_sup_2'] = None
 
     if way_type := rl0101x.find('rl0101ex'):
+        unit_data['way_type'] = way_type.text
         address_components.append(WAY_TYPES[way_type.text])
+    else:
+        unit_data['way_type'] = None
 
     if way_link := rl0101x.find('rl0101fx'):
+        unit_data['way_link'] = way_link.text
         address_components.append(WAY_LINKS[way_link.text])
+    else:
+        unit_data['way_link'] = None
 
     if street_name := rl0101x.find('rl0101gx'):
+        unit_data['street_name'] = street_name.text
         address_components.append(street_name.text)
+    else:
+        unit_data['street_name'] = None
 
     if cardinal_pt := rl0101x.find('rl0101hx'):
+        unit_data['cardinal_pt'] = cardinal_pt.text
         address_components.append(CARDINAL_POINTS[cardinal_pt.text])
+    else:
+        unit_data['cardinal_pt'] = None
 
-    return " ".join(address_components)
+    unit_data['address'] = " ".join(address_components)
 
 
-def generate_apt_num(rl0101x):
+def get_apt_num_components(rl0101x, unit_data):
     apt_num_components = []
-    if apt_num := rl0101x.find('rl0101ix'):
-        apt_num_components.append(apt_num.text)
+
+    if apt_num_1 := rl0101x.find('rl0101ix'):
+        unit_data['apt_num_1'] = apt_num_1.text
+        apt_num_components.append(apt_num_1.text)
+    else:
+        unit_data['apt_num_1'] = None
 
     if apt_num_2 := rl0101x.find('rl0101jx'):
+        unit_data['apt_num_2'] = apt_num_2.text
         apt_num_components.append(apt_num_2.text)
-
-    if len(apt_num_components) > 0:
-        return " ".join(apt_num_components)
     else:
-        return None
+        unit_data['apt_num_2'] = None
+
+    if apt_num_components:
+        unit_data['apt_num'] = " ".join(apt_num_components)
+    else:
+        unit_data['apt_num'] = None
 
 
 def generate_mat18(rl0104):
@@ -268,31 +346,45 @@ def generate_mat18(rl0104):
 def create_table_if_not_exists():
     conn = psycopg2.connect(user=DB_CONFIG['DB_USER'], password=DB_CONFIG['DB_PASSWORD'], database=DB_CONFIG['DB_NAME'])
     cursor = conn.cursor()
+    # Apparently you should never use char(n)
+    # even for fixed length character fields and use text or varchar instead
+    # https://wiki.postgresql.org/wiki/Don%27t_Do_This#Don.27t_use_char.28n.29
     cursor.execute(f"""
-        CREATE TABLE IF NOT EXISTS {DB_CONFIG['TABLE_NAME']} (
-            id CHARACTER(23) PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS {DB_CONFIG['ROLL_TABLE_NAME']} (
+            id TEXT PRIMARY KEY CHECK(length(id)=23),
             year SMALLINT NOT NULL,
-            muni CHARACTER(5) NOT NULL,
+            muni TEXT NOT NULL,
+            muni_code TEXT NOT NULL,
             arrond TEXT,
             address TEXT NOT NULL,
-            apt_num VARCHAR(11),
-            mat18 CHARACTER(18) NOT NULL,
+            num_adr_inf TEXT,
+            num_adr_inf_2 TEXT,
+            num_adr_sup TEXT,
+            num_adr_sup_2 TEXT,
+            way_type TEXT,
+            way_link TEXT,
+            street_name TEXT,
+            cardinal_pt TEXT,
+            apt_num TEXT,
+            apt_num_1 TEXT,
+            apt_num_2 TEXT,
+            mat18 TEXT NOT NULL CHECK(length(mat18)=18),
             cubf SMALLINT NOT NULL,
-            file_num VARCHAR(15),
-            nghbr_unit VARCHAR(4),
+            file_num TEXT,
+            nghbr_unit TEXT,
 
             owner_date DATE,
-            owner_type VARCHAR(8),
-            owner_status  CHARACTER(1),
+            owner_type TEXT,
+            owner_status  TEXT,
 
             lot_lin_dim NUMERIC(8, 2),
             lot_area NUMERIC(15, 2),
             max_floors SMALLINT,
             const_yr SMALLINT,
-            const_yr_real CHARACTER(1),
+            const_yr_real TEXT,
             floor_area NUMERIC(8, 1),
-            phys_link CHARACTER(1),
-            const_type CHARACTER(1),
+            phys_link TEXT,
+            const_type TEXT,
             num_dwelling SMALLINT,
             num_rental SMALLINT,
             num_non_res SMALLINT,
@@ -309,11 +401,12 @@ def create_table_if_not_exists():
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--input-folder', default='data/xml_2022')
-    parser.add_argument('-n', '--num-workers', default=os.cpu_count()-1)
+    parser.add_argument('input_folder', type=Path, help='Path to folder containing the roll XML files.')
+    parser.add_argument('-n', '--num-workers', type=int, default=os.cpu_count()-1, 
+                        help="Number of parallel workers. Defaults to one less than the number of CPUs on the machine.")
     args = parser.parse_args()
 
-    input_folder = Path(args.input_folder)
+    input_folder = args.input_folder
     num_workers = args.num_workers
 
     # Parameter validation
