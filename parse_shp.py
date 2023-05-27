@@ -42,6 +42,9 @@ def parse_shapefile(shp_file):
 
             if i % 10_000 == 0:
                 print(f'\tAt value {i}')
+                conn.commit()
+
+        conn.commit()
 
 
 def create_lat_lng_columns_if_not_exists():
