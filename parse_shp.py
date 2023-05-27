@@ -4,7 +4,6 @@ import shapefile
 from pathlib import Path
 from datetime import datetime
 from dotenv import dotenv_values
-from pyproj import CRS, Transformer
 
 # Read in the database configuration from a .env file
 DB_CONFIG = dotenv_values(".env")

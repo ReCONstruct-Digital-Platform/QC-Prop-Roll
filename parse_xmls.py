@@ -3,14 +3,12 @@ import heapq
 import signal
 import psycopg2
 import argparse
-import shapefile
 from pathlib import Path
 from datetime import datetime
 from bs4 import BeautifulSoup
 from multiprocessing import Pool
 from dotenv import dotenv_values
 from xml.dom.pulldom import parse
-from pyproj import CRS, Transformer
 from psycopg2.extras import execute_values
 
 from utils.qc_roll_mapping import *
