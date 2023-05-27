@@ -45,7 +45,7 @@ optional arguments:
                         Number of parallel workers. Defaults to one less than the number of CPUs on the machine.
 ```
 
-Note: This takes around 3.5 hours using 6 parallel processes on a 6 Core AMD Ryzen 5 4500U 2.375 GHz laptop.
+Note: This takes around 1.5 hours using 6 parallel processes on a 6 Core AMD Ryzen 5 4500U 2.375 GHz laptop.
 
 
 ## 2. Parse the SHP files
@@ -64,6 +64,8 @@ positional arguments:
 optional arguments:
   -h, --help  show this help message and exit
 ```
+
+This script uses a single process and took about 15min on my laptop.
 
 
 ## Future Work

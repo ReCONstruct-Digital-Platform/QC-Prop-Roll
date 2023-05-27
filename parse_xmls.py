@@ -1,25 +1,28 @@
 import os
 import heapq
 import signal
-import random
-import cchardet
 import psycopg2
 import argparse
+import shapefile
 from pathlib import Path
 from datetime import datetime
 from bs4 import BeautifulSoup
 from multiprocessing import Pool
 from dotenv import dotenv_values
+from xml.dom.pulldom import parse
+from pyproj import CRS, Transformer
+from psycopg2.extras import execute_values
 
 from utils.qc_roll_mapping import *
 
 # Read in the database configuration from a .env file
 DB_CONFIG = dotenv_values(".env")
 
-def launch_jobs(input_folder: Path, num_workers: int):
+
+def launch_jobs(input_folder: Path, num_workers: int, test: bool = False):
 
     # Split the XMLs evenly between the workers
-    splits = split_xmls_between_workers(input_folder, num_workers)
+    splits = split_xmls_between_workers(input_folder, num_workers, test=test)
 
     # launch a process pool mapping the parsing function and the XMLs
     with Pool(processes=num_workers) as pool:
@@ -28,7 +31,7 @@ def launch_jobs(input_folder: Path, num_workers: int):
             pass
 
 
-def split_xmls_between_workers(input_folder: Path, num_workers: int):
+def split_xmls_between_workers(input_folder: Path, num_workers: int, test=False):
     """
     Partition the XMLs such that each worker has an approximately equal
     total data size to process. This is because some municipalities (i.e. Montreal)
@@ -42,6 +45,13 @@ def split_xmls_between_workers(input_folder: Path, num_workers: int):
     # Sort sizes in descending order
     size_per_file = dict(sorted(size_per_file.items(), key=lambda x: x[1], reverse=True))
     
+    # For testing only, truncate the dictionary to keep only a single file per worker
+    # We skip the largest files to reduce the run time of this test
+    if test:
+        import itertools
+        size_per_file = dict(itertools.islice(size_per_file.items(), num_workers, 2 * num_workers))
+        print(f'Truncated the input XMLs to {len(size_per_file)}')
+
     # We iterate over the files, starting from the largest 
     # one and distribute them among workers, always giving 
     # the current to the worker with the least amount of data.
@@ -85,132 +95,81 @@ def parse_xmls(xml_files):
 
         print(f'{pid}:\tProcessing {xml_file}')
 
-        xml = open(xml_file, 'r', encoding='utf-8')
-        content = xml.readlines()
-        content = "".join(content)
-        xml = BeautifulSoup(content, 'lxml')
+        # We use a streaming XML API for memory efficiency
+        # Reading the whole file to build a BeautifulSoup object from it was too much
+        event_stream = parse(str(xml_file))
+
+        # Get the municipal code and year entered first
+        # Those are applicable to the whole document
+        for i, (evt, node) in enumerate(event_stream):
+            if evt == 'START_ELEMENT':
+                if node.tagName == 'RLM01A':
+                    event_stream.expandNode(node)
+                    muni_code = node.childNodes[0].nodeValue
+
+                if node.tagName == 'RLM02A':
+                    event_stream.expandNode(node)
+                    year_entered = node.childNodes[0].nodeValue
+                    break
         
-        unit_data = {}
+        current_units = []
+        
+        # Go through all the RLUEx tags - each represents a unit
+        for i, (evt, node) in enumerate(event_stream):
 
-        # Municipal code is at the top
-        muni_code = xml.find('rlm01a').text
+            if evt == 'START_ELEMENT':
+                if node.tagName == 'RLUEx':
+                    # Parse until the closing tag
+                    event_stream.expandNode(node)
+                    unit_xml = BeautifulSoup(node.toxml(), 'lxml')
+                    # First get the MAT18 to create the provincial ID
+                    mat18 = get_mat18(unit_xml)
+                    id = muni_code + mat18
 
-        year_entered = int(xml.find('rlm02a').text)
+                    # Check if the unit already exists before doing any more work
+                    if unit_exists(cursor, id):
+                        continue
+                    
+                    # Start filling the unit values
+                    unit_data = {}
+                    unit_data['id'] = id
+                    unit_data['muni'] = MUNICIPALITIES[f'RL{muni_code}']
+                    unit_data['muni_code'] = muni_code
+                    unit_data['year'] = year_entered
+                    unit_data['mat18'] = mat18
+                    current_units.append(parse_unit_xml(unit_xml, unit_data))
 
-        # Iterate over the units in the file
-        for i, unit in enumerate(xml.find_all('rluex')):
-            
-            # Commit writes every 1000 units
-            if i % 1000 == 0 and i > 0:
+                    # # Extract all the information from the unit XML
+                    unit_data = parse_unit_xml(unit_xml, unit_data)
+
+                    # # Write out the current unit to the DB
+                    # cursor.execute(f"""
+                    #     INSERT INTO {DB_CONFIG['ROLL_TABLE_NAME']} 
+                    #         (id, year, muni, muni_code, arrond, address, num_adr_inf, num_adr_inf_2, num_adr_sup, num_adr_sup_2, 
+                    #         way_type, way_link, street_name, cardinal_pt, apt_num, apt_num_1, apt_num_2, mat18, cubf, 
+                    #         file_num, nghbr_unit, owner_date, owner_type, owner_status, lot_lin_dim, lot_area, max_floors, 
+                    #         const_yr, const_yr_real, floor_area, phys_link, const_type, num_dwelling, num_rental, num_non_res, 
+                    #         apprais_date, lot_value, building_value, value, prev_value)
+                    #     VALUES 
+                    #         (%(id)s, %(year)s, %(muni)s, %(muni_code)s, %(arrond)s, %(address)s, %(num_adr_inf)s, %(num_adr_inf_2)s, 
+                    #         %(num_adr_sup)s, %(num_adr_sup_2)s, %(way_type)s, %(way_link)s, %(street_name)s, %(cardinal_pt)s, 
+                    #         %(apt_num)s, %(apt_num_1)s, %(apt_num_2)s, %(mat18)s, %(cubf)s, %(file_num)s, %(nghbr_unit)s, 
+                    #         %(owner_date)s, %(owner_type)s, %(owner_status)s, %(lot_lin_dim)s, %(lot_area)s, %(max_floors)s, 
+                    #         %(const_yr)s, %(const_yr_real)s, %(floor_area)s, %(phys_link)s, %(const_type)s, %(num_dwelling)s, 
+                    #         %(num_rental)s, %(num_non_res)s, %(apprais_date)s, %(lot_value)s, %(building_value)s, %(value)s, 
+                    #         %(prev_value)s)
+                    #     """, unit_data
+                    # )
+
+            # Print an update and commit latest writes
+            if i % 3000 == 0 and i > 0:
+                write_out_current_units(current_units, cursor)
+                current_units = []
                 conn.commit()
-                print(f'{pid}:\t\tOn unit {i}')
-
-            unit_data = {}
-            unit_data['muni'] = MUNICIPALITIES[f'RL{muni_code}']
-            unit_data['muni_code'] = muni_code
-            unit_data['year'] = year_entered
-
-            # RL0104 - we'll use it to create the MAT18 and ID_PROVINC used in the GIS data
-            # Do this first to check if the unit has already been entered and skip work
-            rl0104 = unit.find('rl0104')
-            mat18 = generate_mat18(rl0104)
-            unit_data['mat18'] = mat18
-            id = muni_code + mat18
-            unit_data['id'] = id
-
-            # Check if the unit already exists in which case, skip to the next one
-            if unit_exists(cursor, id):
-                continue
-
-            # RL0101: Unit Identification Fields
-            # Every unit must have at least RL0101Gx, so RL0101 will always be present
-            # They made so that multiple RL0101x could be present, but in practice there's always a single one
-            rl0101x = unit.find('rl0101x')
-            get_address_components_and_resolve(rl0101x, unit_data)
-
-            # Keep the apt number separate from the street address
-            # We can use this to merge MURBs that are disaggregated into indiviudal units
-            get_apt_num_components(rl0101x, unit_data)
-
-            # RL0102A 
-            unit_data['arrond'] = extract_field_or_none(unit, 'rl0102a')
-
-            # CUBF is mandatory
-            unit_data['cubf'] = extract_field_or_none(unit, 'rl0105a', type=int) 
-
-            unit_data['file_num'] = extract_field_or_none(unit, 'rl0106a')
-            unit_data['nghbr_unit'] = extract_field_or_none(unit, 'rl0107a')
-            
-
-            # RL0201 - Owner Info
-            # These are all mandatory fields
-            # Most of it is redacted but we can know if the owner is a physical or moral person
-            
-            rl0201 = unit.find('rl0201')
-
-            # There can be multiple signup dates to the assessment roll
-            # Take only the latest one
-            max_date = datetime.strptime('1500-01-01', '%Y-%m-%d')
-            for rl0201x in rl0201.find_all('rl0201x'):
+                print(f'{pid}:\t\tOn unit {i}\t{xml_file.name}')
                 
-                rl0201gx_tmp = rl0201x.find('rl0201gx').text
-                date_time = datetime.strptime(rl0201gx_tmp, '%Y-%m-%d')
-
-                if date_time > max_date:
-                    owner_date = rl0201gx_tmp
-                    if rl0201x.find('rl0201hx').text == '1':
-                        owner_type = 'physical'
-                    else:
-                        owner_type = 'moral'
-
-            unit_data['owner_date'] = owner_date
-            unit_data['owner_type'] = owner_type
-            unit_data['owner_status'] = rl0201.find('rl0201u').text
-            
-
-            # RL030Xx - Unit Characteristics
-            unit_data['lot_lin_dim'] = extract_field_or_none(unit, 'rl0301a', type=float)
-            unit_data['lot_area'] = extract_field_or_none(unit, 'rl0302a', type=float)
-            unit_data['max_floors'] = extract_field_or_none(unit, 'rl0306a', type=int)
-            unit_data['const_yr'] = extract_field_or_none(unit, 'rl0307a', type=int)
-            unit_data['const_yr_real'] = extract_field_or_none(unit, 'rl0307b')
-            unit_data['floor_area'] = extract_field_or_none(unit, 'rl0308a', type=float)
-            # Could resolve this here or later
-            unit_data['phys_link'] = extract_field_or_none(unit, 'rl0309a')
-            # Could resolve this here or later
-            unit_data['const_type'] = extract_field_or_none(unit, 'rl0310a')
-            unit_data['num_dwelling'] = extract_field_or_none(unit, 'rl0311a', type=int)
-            unit_data['num_rental'] = extract_field_or_none(unit, 'rl0312a', type=int)
-            unit_data['num_non_res'] = extract_field_or_none(unit, 'rl0313a', type=int)
-            # rl0314 - rl0315 are related to agricultural zones, we ignore them here
-
-            # RL040XX - Value 
-            unit_data['apprais_date'] = extract_field_or_none(unit, 'rl0401a')
-            unit_data['lot_value'] = extract_field_or_none(unit, 'rl0402a', type=float)
-            unit_data['building_value'] = extract_field_or_none(unit, 'rl0403a', type=float)
-            unit_data['value'] = extract_field_or_none(unit, 'rl0404a', type=float)
-            unit_data['prev_value'] = extract_field_or_none(unit, 'rl0405a', type=float)
-
-            # Write out the current unit to the DB
-            cursor.execute(f"""
-                INSERT INTO {DB_CONFIG['ROLL_TABLE_NAME']} 
-                    (id, year, muni, muni_code, arrond, address, num_adr_inf, num_adr_inf_2, num_adr_sup, num_adr_sup_2, 
-                    way_type, way_link, street_name, cardinal_pt, apt_num, apt_num_1, apt_num_2, mat18, cubf, 
-                    file_num, nghbr_unit, owner_date, owner_type, owner_status, lot_lin_dim, lot_area, max_floors, 
-                    const_yr, const_yr_real, floor_area, phys_link, const_type, num_dwelling, num_rental, num_non_res, 
-                    apprais_date, lot_value, building_value, value, prev_value)
-                VALUES 
-                    (%(id)s, %(year)s, %(muni)s, %(muni_code)s, %(arrond)s, %(address)s, %(num_adr_inf)s, %(num_adr_inf_2)s, 
-                    %(num_adr_sup)s, %(num_adr_sup_2)s, %(way_type)s, %(way_link)s, %(street_name)s, %(cardinal_pt)s, 
-                    %(apt_num)s, %(apt_num_1)s, %(apt_num_2)s, %(mat18)s, %(cubf)s, %(file_num)s, %(nghbr_unit)s, 
-                    %(owner_date)s, %(owner_type)s, %(owner_status)s, %(lot_lin_dim)s, %(lot_area)s, %(max_floors)s, 
-                    %(const_yr)s, %(const_yr_real)s, %(floor_area)s, %(phys_link)s, %(const_type)s, %(num_dwelling)s, 
-                    %(num_rental)s, %(num_non_res)s, %(apprais_date)s, %(lot_value)s, %(building_value)s, %(value)s, 
-                    %(prev_value)s)
-                """, unit_data
-            )
-
         # Flush out the current file's units
+        write_out_current_units(current_units, cursor)
         conn.commit()
 
         print(f'{pid}:\tTotal: {i + 1} units')
@@ -219,6 +178,104 @@ def parse_xmls(xml_files):
         total_units += i + 1
         
     print(f'{pid}:\tParsed {total_units} units in total!')
+
+
+def write_out_current_units(current_units, cursor):
+
+    template = """(%(id)s, %(year)s, %(muni)s, %(muni_code)s, %(arrond)s, %(address)s, %(num_adr_inf)s, %(num_adr_inf_2)s, 
+        %(num_adr_sup)s, %(num_adr_sup_2)s, %(way_type)s, %(way_link)s, %(street_name)s, %(cardinal_pt)s, 
+        %(apt_num)s, %(apt_num_1)s, %(apt_num_2)s, %(mat18)s, %(cubf)s, %(file_num)s, %(nghbr_unit)s, 
+        %(owner_date)s, %(owner_type)s, %(owner_status)s, %(lot_lin_dim)s, %(lot_area)s, %(max_floors)s, 
+        %(const_yr)s, %(const_yr_real)s, %(floor_area)s, %(phys_link)s, %(const_type)s, %(num_dwelling)s, 
+        %(num_rental)s, %(num_non_res)s, %(apprais_date)s, %(lot_value)s, %(building_value)s, %(value)s, 
+        %(prev_value)s)"""
+    
+    execute_values(cursor, f"""INSERT INTO {DB_CONFIG['ROLL_TABLE_NAME']} 
+        (id, year, muni, muni_code, arrond, address, num_adr_inf, num_adr_inf_2, num_adr_sup, num_adr_sup_2, 
+        way_type, way_link, street_name, cardinal_pt, apt_num, apt_num_1, apt_num_2, mat18, cubf, 
+        file_num, nghbr_unit, owner_date, owner_type, owner_status, lot_lin_dim, lot_area, max_floors, 
+        const_yr, const_yr_real, floor_area, phys_link, const_type, num_dwelling, num_rental, num_non_res, 
+        apprais_date, lot_value, building_value, value, prev_value) VALUES %s""", current_units, template=template)
+
+
+def get_mat18(unit):
+    # RL0104 - we'll use it to create the MAT18 and ID_PROVINC used in the GIS data
+    # Do this first to check if the unit has already been entered and skip work
+    rl0104 = unit.find('rl0104')
+    return generate_mat18(rl0104)
+
+def parse_unit_xml(unit_xml, unit_data):
+
+    # RL0101: Unit Identification Fields
+    # Every unit must have at least RL0101Gx, so RL0101 will always be present
+    # They made so that multiple RL0101x could be present, but in practice there's always a single one
+    rl0101x = unit_xml.find('rl0101x')
+    get_address_components_and_resolve(rl0101x, unit_data)
+
+    # Keep the apt number separate from the street address
+    # We can use this to merge MURBs that are disaggregated into indiviudal units
+    get_apt_num_components(rl0101x, unit_data)
+
+    # RL0102A 
+    unit_data['arrond'] = extract_field_or_none(unit_xml, 'rl0102a')
+
+    # CUBF is mandatory
+    unit_data['cubf'] = extract_field_or_none(unit_xml, 'rl0105a', type=int) 
+
+    unit_data['file_num'] = extract_field_or_none(unit_xml, 'rl0106a')
+    unit_data['nghbr_unit'] = extract_field_or_none(unit_xml, 'rl0107a')
+    
+
+    # RL0201 - Owner Info
+    # These are all mandatory fields
+    # Most of it is redacted but we can know if the owner is a physical or moral person
+    rl0201 = unit_xml.find('rl0201')
+
+    # There can be multiple signup dates to the assessment roll
+    # Take only the latest one
+    max_date = datetime.strptime('1500-01-01', '%Y-%m-%d')
+    for rl0201x in rl0201.find_all('rl0201x'):
+        
+        rl0201gx_tmp = rl0201x.find('rl0201gx').text
+        date_time = datetime.strptime(rl0201gx_tmp, '%Y-%m-%d')
+
+        if date_time > max_date:
+            owner_date = rl0201gx_tmp
+            if rl0201x.find('rl0201hx').text == '1':
+                owner_type = 'physical'
+            else:
+                owner_type = 'moral'
+
+    unit_data['owner_date'] = owner_date
+    unit_data['owner_type'] = owner_type
+    unit_data['owner_status'] = rl0201.find('rl0201u').text
+    
+
+    # RL030Xx - Unit Characteristics
+    unit_data['lot_lin_dim'] = extract_field_or_none(unit_xml, 'rl0301a', type=float)
+    unit_data['lot_area'] = extract_field_or_none(unit_xml, 'rl0302a', type=float)
+    unit_data['max_floors'] = extract_field_or_none(unit_xml, 'rl0306a', type=int)
+    unit_data['const_yr'] = extract_field_or_none(unit_xml, 'rl0307a', type=int)
+    unit_data['const_yr_real'] = extract_field_or_none(unit_xml, 'rl0307b')
+    unit_data['floor_area'] = extract_field_or_none(unit_xml, 'rl0308a', type=float)
+    # Could resolve this here or later
+    unit_data['phys_link'] = extract_field_or_none(unit_xml, 'rl0309a')
+    # Could resolve this here or later
+    unit_data['const_type'] = extract_field_or_none(unit_xml, 'rl0310a')
+    unit_data['num_dwelling'] = extract_field_or_none(unit_xml, 'rl0311a', type=int)
+    unit_data['num_rental'] = extract_field_or_none(unit_xml, 'rl0312a', type=int)
+    unit_data['num_non_res'] = extract_field_or_none(unit_xml, 'rl0313a', type=int)
+    # rl0314 - rl0315 are related to agricultural zones, we ignore them here
+
+    # RL040XX - Value 
+    unit_data['apprais_date'] = extract_field_or_none(unit_xml, 'rl0401a')
+    unit_data['lot_value'] = extract_field_or_none(unit_xml, 'rl0402a', type=float)
+    unit_data['building_value'] = extract_field_or_none(unit_xml, 'rl0403a', type=float)
+    unit_data['value'] = extract_field_or_none(unit_xml, 'rl0404a', type=float)
+    unit_data['prev_value'] = extract_field_or_none(unit_xml, 'rl0405a', type=float)
+
+    return unit_data
+
 
 
 def unit_exists(cursor, id):
@@ -397,24 +454,26 @@ def create_table_if_not_exists():
         );""")
     conn.commit()
     conn.close()
-    
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('input_folder', type=Path, help='Path to folder containing the roll XML files.')
+    parser.add_argument('xml_folder', type=Path, help='Path to folder containing the roll XML files.')
     parser.add_argument('-n', '--num-workers', type=int, default=os.cpu_count()-1, 
                         help="Number of parallel workers. Defaults to one less than the number of CPUs on the machine.")
+    parser.add_argument('-t', '--test', action='store_true', help='Run in testing mode on a few XMLs')
     args = parser.parse_args()
 
-    input_folder = args.input_folder
+    input_folder = args.xml_folder
     num_workers = args.num_workers
+    test = args.test
 
     # Parameter validation
     if not input_folder.exists() or not input_folder.is_dir():
-        print(f'Error: bad input directory given')
+        print(f'Error: bad XML directory given')
         exit(-1)
 
     t0 = datetime.now()
     create_table_if_not_exists()
-    launch_jobs(input_folder, num_workers)
-    print(f'Finished in {datetime.now() - t0}')
+    launch_jobs(input_folder, num_workers, test=test)
+    print(f'Finished parsing XMLs in {datetime.now() - t0}')
