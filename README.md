@@ -79,7 +79,20 @@ optional arguments:
 
 This script uses a single process and took about 15min on my laptop.
 
+## 3. Aggregate individually listed MURB units into single buildings (Optional)
 
-## Future Work
-See if doing a first run and gathering the number of units in each file and distributing the XMLs such that each process has approximately the same number of units leads to faster execution time.
-Currently, with a random split of XMLs, one process can end up lasting much longer than others if it took a long time procesing some of the very large files.
+Some MURBs (Multi-Unit Residential Building) are listed as individual evaluation units at the same coordinates and address, while others have a single evaluation unit. The `aggregate_murbs.py` script detects these individually listed units and merges them into a new entry, replacing the old ones. 
+
+To do this, we group entries with duplicate (lat, lng, address, muni) having CUBF = 1000 (the residential land-use code), determine summary information for the new entry, copy the individual entries to a new table (to save them in case you want to inspect them later), delete them from the main table, and insert the new aggregated MURB entry.
+
+## SQL queries
+
+Export a CSV of all MURBs
+```sql
+\copy (SELECT r.id, lat, lng, muni_code as "geographic code", address, arrond as "borough", muni as "city", cubf as "CUBF", const_yr as "vintage", const_yr_real as "vintage (real or est.)", num_dwelling as "num dwellings", max_floors as "num floors", lot_lin_dim as "lot lin dim", lot_area as "lot area", floor_area as "floor area", pl.value as "physical connection", ct.value as  "const typology", num_rental as "num rental units", num_non_res as "num non-res units", owner_type as "owner type", os.value as "onwer status" from roll r left join phys_link pl on r.phys_link = pl.id left join const_type ct on r.const_type = ct.id left join owner_status os on r.owner_status = os.id where cubf = 1000 and num_dwelling >= 3 order by num_dwelling desc) to 'all_murbs.csv' csv header;
+```
+
+Export a CSV of all evaluation units
+```sql
+\copy (SELECT r.id, lat, lng, muni_code as "geographic code", address, arrond as "borough", muni as "city", cubf as "CUBF", const_yr as "vintage", const_yr_real as "vintage (real or est.)", num_dwelling as "num dwellings", lot_lin_dim as "lot lin dim", lot_area as "lot area", floor_area as "floor area", max_floors as "num floors", pl.value as "physical connection", ct.value as "const typology", num_rental as "num rental units", num_non_res as "num non-res units", owner_type as "owner type", os.value as "onwer status" from roll r left join phys_link pl on r.phys_link = pl.id left join const_type ct on r.const_type = ct.id left join owner_status os on r.owner_status = os.id) to 'qc_prop_roll_full.csv' csv header;
+```

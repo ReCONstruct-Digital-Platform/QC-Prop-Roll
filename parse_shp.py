@@ -46,6 +46,45 @@ def parse_shapefile(shp_file):
         conn.commit()
 
 
+def add_lat_lng_to_specific_ids(shp_file):
+    conn = psycopg2.connect(user=DB_CONFIG['DB_USER'], password=DB_CONFIG['DB_PASSWORD'], database=DB_CONFIG['DB_NAME'])
+    cursor = conn.cursor()
+
+    with shapefile.Reader(shp_file) as shp:
+        
+        num_units = len(shp)
+        print(f'Shapefile contains {num_units} units')
+
+        # Get a list of the IDs we want to update
+        cursor.execute(f"""SELECT id from {DB_CONFIG['MURB_DISAG_TABLE_NAME']}""")
+        ids_to_update = [o[0] for o in cursor.fetchall()]
+        ids_to_update = set(ids_to_update)
+
+        for i in range(num_units):
+
+            id = shp.record(i)[0]
+            
+            # If the ID is not in our list, skip it
+            if id not in ids_to_update:
+                continue
+
+            lng, lat = shp.shape(i).points[0]
+            cursor.execute(f"""
+                UPDATE {DB_CONFIG['MURB_DISAG_TABLE_NAME']}
+                SET
+                    lat = %s,
+                    lng = %s
+                    WHERE id = %s
+            """, (lat, lng, id)
+            )
+
+            if i % 10_000 == 0:
+                print(f'\tAt value {i}')
+                conn.commit()
+
+        conn.commit()
+
+
 def create_lat_lng_columns_if_not_exists():
     conn = psycopg2.connect(user=DB_CONFIG['DB_USER'], password=DB_CONFIG['DB_PASSWORD'], database=DB_CONFIG['DB_NAME'])
     cursor = conn.cursor()

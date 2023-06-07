@@ -6,8 +6,8 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 from bs4 import BeautifulSoup
-from multiprocessing import Pool
 from dotenv import dotenv_values
+from multiprocessing import Pool
 from xml.dom.pulldom import parse
 from psycopg2.extras import execute_values
 
@@ -140,25 +140,6 @@ def parse_xmls(xml_files):
                     # # Extract all the information from the unit XML
                     unit_data = parse_unit_xml(unit_xml, unit_data)
 
-                    # # Write out the current unit to the DB
-                    # cursor.execute(f"""
-                    #     INSERT INTO {DB_CONFIG['ROLL_TABLE_NAME']} 
-                    #         (id, year, muni, muni_code, arrond, address, num_adr_inf, num_adr_inf_2, num_adr_sup, num_adr_sup_2, 
-                    #         way_type, way_link, street_name, cardinal_pt, apt_num, apt_num_1, apt_num_2, mat18, cubf, 
-                    #         file_num, nghbr_unit, owner_date, owner_type, owner_status, lot_lin_dim, lot_area, max_floors, 
-                    #         const_yr, const_yr_real, floor_area, phys_link, const_type, num_dwelling, num_rental, num_non_res, 
-                    #         apprais_date, lot_value, building_value, value, prev_value)
-                    #     VALUES 
-                    #         (%(id)s, %(year)s, %(muni)s, %(muni_code)s, %(arrond)s, %(address)s, %(num_adr_inf)s, %(num_adr_inf_2)s, 
-                    #         %(num_adr_sup)s, %(num_adr_sup_2)s, %(way_type)s, %(way_link)s, %(street_name)s, %(cardinal_pt)s, 
-                    #         %(apt_num)s, %(apt_num_1)s, %(apt_num_2)s, %(mat18)s, %(cubf)s, %(file_num)s, %(nghbr_unit)s, 
-                    #         %(owner_date)s, %(owner_type)s, %(owner_status)s, %(lot_lin_dim)s, %(lot_area)s, %(max_floors)s, 
-                    #         %(const_yr)s, %(const_yr_real)s, %(floor_area)s, %(phys_link)s, %(const_type)s, %(num_dwelling)s, 
-                    #         %(num_rental)s, %(num_non_res)s, %(apprais_date)s, %(lot_value)s, %(building_value)s, %(value)s, 
-                    #         %(prev_value)s)
-                    #     """, unit_data
-                    # )
-
             # Print an update and commit latest writes
             if i % 3000 == 0 and i > 0:
                 write_out_current_units(current_units, cursor)
@@ -193,7 +174,8 @@ def write_out_current_units(current_units, cursor):
         way_type, way_link, street_name, cardinal_pt, apt_num, apt_num_1, apt_num_2, mat18, cubf, 
         file_num, nghbr_unit, owner_date, owner_type, owner_status, lot_lin_dim, lot_area, max_floors, 
         const_yr, const_yr_real, floor_area, phys_link, const_type, num_dwelling, num_rental, num_non_res, 
-        apprais_date, lot_value, building_value, value, prev_value) VALUES %s""", current_units, template=template)
+        apprais_date, lot_value, building_value, value, prev_value) VALUES %s ON CONFLICT DO NOTHING""", 
+        current_units, template=template)
 
 
 def get_mat18(unit):
@@ -398,7 +380,7 @@ def generate_mat18(rl0104):
     return mat18
 
 
-def create_table_if_not_exists():
+def create_tables_if_not_exists():
     conn = psycopg2.connect(user=DB_CONFIG['DB_USER'], password=DB_CONFIG['DB_PASSWORD'], database=DB_CONFIG['DB_NAME'])
     cursor = conn.cursor()
     # Apparently you should never use char(n)
@@ -430,7 +412,7 @@ def create_table_if_not_exists():
 
             owner_date DATE,
             owner_type TEXT,
-            owner_status  TEXT,
+            owner_status TEXT,
 
             lot_lin_dim NUMERIC(8, 2),
             lot_area NUMERIC(15, 2),
@@ -450,6 +432,50 @@ def create_table_if_not_exists():
             value INTEGER,
             prev_value INTEGER
         );""")
+
+    # Create auxiliary table with human readable values of the owner status field
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS {DB_CONFIG['OWNER_STATUS_TABLE_NAME']} (
+            id TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );""")
+
+    # Create auxiliary table with human readable values of the physical link field
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS {DB_CONFIG['PHYS_LINK_TABLE_NAME']} (
+            id TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );""")
+    
+    # Create auxiliary table with human readable values of the construction type field
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS {DB_CONFIG['CONST_TYPE_TABLE_NAME']} (
+            id TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );""")
+    
+    conn.commit()
+    
+    OWNER_STATUSES = (('1', 'landowner'), ('2', 'lessor'), ('3', 'condo owner'), 
+        ('4', 'lessor of public land'), ('5', 'tenant of tax-exempt building'), ('6', 'building owner on public land'),
+        ('7', 'trailer building owner'), ('8', 'undivided co-owner'), ('9', 'other'))
+    
+    PHYSICAL_LINKS = [('1', 'single-detached'), ('2', 'semi-detached'), ('3', 'row house'),
+        ('4', 'row house (end unit)'), ('5', 'integrated')]
+    
+    CONSTRUCTION_TYPES = [('1', 'single-storey'), ('2', 'staggered-level'), ('3', 'modular prefab'),
+        ('4', 'attic'), ('5', 'full-storey')]
+    
+
+    execute_values(cursor, f"""INSERT INTO {DB_CONFIG['OWNER_STATUS_TABLE_NAME']}
+        (id, value) VALUES %s ON CONFLICT DO NOTHING""", OWNER_STATUSES)
+    
+    execute_values(cursor, f"""INSERT INTO {DB_CONFIG['PHYS_LINK_TABLE_NAME']} 
+        (id, value) VALUES %s ON CONFLICT DO NOTHING""", PHYSICAL_LINKS)
+    
+    execute_values(cursor, f"""INSERT INTO {DB_CONFIG['CONST_TYPE_TABLE_NAME']} 
+        (id, value) VALUES %s ON CONFLICT DO NOTHING""", CONSTRUCTION_TYPES)
+
     conn.commit()
     conn.close()
 
@@ -460,11 +486,13 @@ if __name__ == '__main__':
     parser.add_argument('-n', '--num-workers', type=int, default=os.cpu_count()-1, 
                         help="Number of parallel workers. Defaults to one less than the number of CPUs on the machine.")
     parser.add_argument('-t', '--test', action='store_true', help='Run in testing mode on a few XMLs')
+    parser.add_argument('-c', '--create-tables', action='store_true', help='Create the tables and exit')
     args = parser.parse_args()
 
     input_folder = args.xml_folder
     num_workers = args.num_workers
     test = args.test
+    create_tables = args.create_tables
 
     # Parameter validation
     if not input_folder.exists() or not input_folder.is_dir():
@@ -472,6 +500,8 @@ if __name__ == '__main__':
         exit(-1)
 
     t0 = datetime.now()
-    create_table_if_not_exists()
+    create_tables_if_not_exists()
+    if create_tables:
+        exit()
     launch_jobs(input_folder, num_workers, test=test)
     print(f'Finished parsing XMLs in {datetime.now() - t0}')
