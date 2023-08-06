@@ -50,7 +50,6 @@ def aggregate_murbs():
     results = cursor.fetchall()
     print(f'{len(results)} duplicates found')
 
-
     SQL_GET_DUPLICATES = f"""select * from {DB_CONFIG['ROLL_TABLE_NAME']} 
     WHERE lat = %s and lng = %s and address = %s and muni = %s;"""
 
@@ -64,6 +63,7 @@ def aggregate_murbs():
         duplicates = cursor.fetchall()
 
         if len(duplicates) < 1:
+            print(f'Error: no duplicates found for {res}')
             continue
         
         # Copy the duplicates to the new table
@@ -146,12 +146,26 @@ def aggregate_murbs():
         
         # Initialize the aggregated MURB data
         agg_data = {
-            'id': dupe['id'][:-4] + '9999',
+            'id': dupe['id'][:-4] + '9999', # We set the last 4 digits of the id to 9999 to recognize them
             'lat': lat,
             'lng': lng,
             'address': address,
+            # All of these address fields should be the same for all duplicates, since they
+            # were concatenated to form the 'address' field, which is the same for all
+            'num_adr_inf': dupe['num_adr_inf'],
+            'num_adr_inf_2': dupe['num_adr_inf_2'],
+            'num_adr_sup': dupe['num_adr_sup'],
+            'num_adr_sup_2': dupe['num_adr_sup_2'],
+            'way_type': dupe['way_type'],
+            'way_link': dupe['way_link'],
+            'street_name': dupe['street_name'],
+            'cardinal_pt': dupe['cardinal_pt'],
+            'apt_num': dupe['apt_num'],
+            'apt_num_1': dupe['apt_num_1'],
+            'apt_num_2': dupe['apt_num_2'],
+
             'muni': muni,
-            'mat18': dupe['mat18'][:-4] + '9999',
+            'mat18': dupe['mat18'][:-4] + '9999', # We set the last 4 digits of the id to 9999 to recognize them
             'phys_link': '1',   # set as detached since we'll be representing the whole building
             'const_type': '5'   # full-storey 
         }
@@ -185,10 +199,10 @@ def aggregate_murbs():
         # May overestimate for some
         agg_data['num_dwelling'] = res['sum_dwellings']
 
-        # write out the new aggregate MURB
+        # Write out the new aggregate MURB
         cursor.execute(SQL_INSERT_AGGREGATED_MURB, agg_data)
 
-        # delete the duplicates
+        # delete all the duplicates by ID
         execute_values(cursor, SQL_DELETE_DUPLICATES, dupe_ids)
         conn.commit()
 
@@ -249,7 +263,7 @@ def infer_number_of_floors(max_apt_num, lat, lng):
     num_floors = 1
     # There are only 3 buildings with apt_num > 10,000
     # so we have some hard-coded logic here
-    if max_apt_num >= 10000:
+    if max_apt_num >= 10_000:
         # 4040 rue de l' ÉCLUSE
         if lat == 46.7174122671 and lng == -71.2773427875:
             num_floors = 3

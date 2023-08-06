@@ -50,8 +50,8 @@ def split_xmls_between_workers(input_folder: Path, num_workers: int, test=False)
         size_per_file = dict(itertools.islice(size_per_file.items(), num_workers, 2 * num_workers))
         print(f'Truncated the input XMLs to {len(size_per_file)}')
 
-    # We iterate over the files, starting from the largest 
-    # one and distribute them among workers, always giving 
+    # We iterate over the files, starting from the one with largest
+    # file size and distribute them among workers, always giving 
     # the current to the worker with the least amount of data.
     # Using a min heap, we quickly get the worker with the least amount of data.
     splits = [[] for _ in range(num_workers)]
@@ -409,11 +409,9 @@ def create_tables_if_not_exists():
             cubf SMALLINT NOT NULL,
             file_num TEXT,
             nghbr_unit TEXT,
-
             owner_date DATE,
             owner_type TEXT,
             owner_status TEXT,
-
             lot_lin_dim NUMERIC(8, 2),
             lot_area NUMERIC(15, 2),
             max_floors SMALLINT,
@@ -425,7 +423,6 @@ def create_tables_if_not_exists():
             num_dwelling SMALLINT,
             num_rental SMALLINT,
             num_non_res SMALLINT,
-
             apprais_date DATE,
             lot_value INTEGER,
             building_value INTEGER,

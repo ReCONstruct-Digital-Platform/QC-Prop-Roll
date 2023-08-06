@@ -18,7 +18,7 @@ def parse_shapefile(shp_file):
         print(f'Shapefile contains {num_units} units')
 
         for i in range(num_units):
-
+            # The ID field is globally unique for evaluation units
             id = shp.record(i)[0]
             lng, lat = shp.shape(i).points[0]
             # We don't need to transform the coordinates, the point  
@@ -44,6 +44,15 @@ def parse_shapefile(shp_file):
                 conn.commit()
 
         conn.commit()
+
+def cleanup_entries_without_coords():
+    """
+    Delete all entries for which we did not have coordinates
+    """
+    conn = psycopg2.connect(user=DB_CONFIG['DB_USER'], password=DB_CONFIG['DB_PASSWORD'], database=DB_CONFIG['DB_NAME'])
+    cursor = conn.cursor()
+    cursor.execute(f"DELETE FROM {DB_CONFIG['ROLL_TABLE_NAME']} WHERE lat is null or lng is null;")
+    conn.commit()
 
 
 def add_lat_lng_to_specific_ids(shp_file):
@@ -98,7 +107,9 @@ def create_lat_lng_columns_if_not_exists():
     
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Parse the shape file associated with the property roll and add lat/lng coordinates to evaluation units."
+    )
     parser.add_argument('input_file', type=Path, help="Path to the rol_unite_p.shp file")
     args = parser.parse_args()
 
@@ -112,4 +123,6 @@ if __name__ == '__main__':
     t0 = datetime.now()
     create_lat_lng_columns_if_not_exists()
     parse_shapefile(input_file)
+    cleanup_entries_without_coords()
+
     print(f'Finished in {datetime.now() - t0}')

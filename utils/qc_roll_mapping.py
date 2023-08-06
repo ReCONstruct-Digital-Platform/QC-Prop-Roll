@@ -1198,7 +1198,7 @@ WAY_TYPES = {
 # See p225
 # https://www.mamh.gouv.qc.ca/fileadmin/publications/evaluation_fonciere/manuel_evaluation_fonciere/2022/MEFQ_2022.pdf 
 WAY_LINKS = {
-    "A": "à",
+    "A":"à",
     "B":"à l'",
     "C":"à la",
     "D":"au",
@@ -1221,7 +1221,7 @@ WAY_LINKS = {
     "U":"sur l'",
     "V":"sur la",
     "W":"sur le",
-    "X": "sur les"
+    "X":"sur les"
 }
 
 # See p226
