@@ -457,8 +457,8 @@ def create_tables_if_not_exists():
         ('4', 'lessor of public land'), ('5', 'tenant of tax-exempt building'), ('6', 'building owner on public land'),
         ('7', 'trailer building owner'), ('8', 'undivided co-owner'), ('9', 'other'))
     
-    PHYSICAL_LINKS = [('1', 'single-detached'), ('2', 'semi-detached'), ('3', 'row house'),
-        ('4', 'row house (end unit)'), ('5', 'integrated')]
+    PHYSICAL_LINKS = [('1', 'single-detached'), ('2', 'semi-detached'), ('3', 'row house (one side)'),
+        ('4', 'row house'), ('5', 'integrated')]
     
     CONSTRUCTION_TYPES = [('1', 'single-storey'), ('2', 'staggered-level'), ('3', 'modular prefab'),
         ('4', 'attic'), ('5', 'full-storey')]
