@@ -7,7 +7,7 @@ from pathlib import Path
 from datetime import datetime
 from bs4 import BeautifulSoup
 from dotenv import dotenv_values
-from multiprocessing import Pool
+from multiprocessing import Pool, Array
 from xml.dom.pulldom import parse
 from psycopg2.extras import execute_values
 
@@ -22,11 +22,18 @@ def launch_jobs(input_folder: Path, num_workers: int, test: bool = False):
     # Split the XMLs evenly between the workers
     splits = split_xmls_between_workers(input_folder, num_workers, test=test)
 
+    arr = Array('i', range(10))
+    num_units_per_process = []
+
     # launch a process pool mapping the parsing function and the XMLs
     with Pool(processes=num_workers) as pool:
-        # pool.map(parse_xmls, splits)
-        for _ in pool.imap_unordered(parse_xmls, splits):
-            pass
+        num_units_per_process.append(pool.map(count_units_in_xml, splits))
+        # for _ in pool.imap_unordered(parse_xmls, splits):
+        #     pass
+
+    num_units_per_process = num_units_per_process[0]
+    print(num_units_per_process)
+    print(f'Total units: {sum(num_units_per_process)}')
 
 
 def split_xmls_between_workers(input_folder: Path, num_workers: int, test=False):
@@ -159,22 +166,59 @@ def parse_xmls(xml_files):
     print(f'{pid}:\tParsed {total_units} units in total!')
 
 
+def count_units_in_xml(xml_files):
+    try:
+        pid = os.getpid()
+        total_units = 0
+
+        for xml_file in xml_files:
+
+            print(f'{pid}:\tProcessing {xml_file}')
+
+            # We use a streaming XML API for memory efficiency
+            # Reading the whole file to build a BeautifulSoup object from it was too much
+            event_stream = parse(str(xml_file))
+
+            # Get the municipal code and year entered first
+            # Those are applicable to the whole document
+            for i, (evt, node) in enumerate(event_stream):
+                if evt == 'START_ELEMENT':
+                    if node.tagName == 'RLM01A':
+                        event_stream.expandNode(node)
+                        muni_code = node.childNodes[0].nodeValue
+
+                    if node.tagName == 'RLM02A':
+                        event_stream.expandNode(node)
+                        year_entered = node.childNodes[0].nodeValue
+                        break
+            
+            current_units = []
+            
+            # Go through all the RLUEx tags - each represents a unit
+            for i, (evt, node) in enumerate(event_stream):
+
+                if evt == 'START_ELEMENT':
+                    if node.tagName == 'RLUEx':
+                        total_units += 1
+        return total_units
+
+    except KeyboardInterrupt:
+        return total_units
+
 def write_out_current_units(current_units, cursor):
 
     template = """(%(id)s, %(year)s, %(muni)s, %(muni_code)s, %(arrond)s, %(address)s, %(num_adr_inf)s, %(num_adr_inf_2)s, 
-        %(num_adr_sup)s, %(num_adr_sup_2)s, %(way_type)s, %(way_link)s, %(street_name)s, %(cardinal_pt)s, 
-        %(apt_num)s, %(apt_num_1)s, %(apt_num_2)s, %(mat18)s, %(cubf)s, %(file_num)s, %(nghbr_unit)s, 
-        %(owner_date)s, %(owner_type)s, %(owner_status)s, %(lot_lin_dim)s, %(lot_area)s, %(max_floors)s, 
-        %(const_yr)s, %(const_yr_real)s, %(floor_area)s, %(phys_link)s, %(const_type)s, %(num_dwelling)s, 
-        %(num_rental)s, %(num_non_res)s, %(apprais_date)s, %(lot_value)s, %(building_value)s, %(value)s, 
-        %(prev_value)s)"""
+        %(num_adr_sup)s, %(num_adr_sup_2)s, %(street_name)s, %(apt_num)s, %(apt_num_1)s, %(apt_num_2)s, %(mat18)s, %(cubf)s, 
+        %(file_num)s, %(nghbr_unit)s, %(owner_date)s, %(owner_type)s, %(owner_status)s, %(lot_lin_dim)s, %(lot_area)s, 
+        %(max_floors)s, %(const_yr)s, %(const_yr_real)s, %(floor_area)s, %(phys_link)s, %(const_type)s, %(num_dwelling)s, 
+        %(num_rental)s, %(num_non_res)s, %(apprais_date)s, %(lot_value)s, %(building_value)s, %(value)s, %(prev_value)s)"""
     
     execute_values(cursor, f"""INSERT INTO {DB_CONFIG['ROLL_TABLE_NAME']} 
         (id, year, muni, muni_code, arrond, address, num_adr_inf, num_adr_inf_2, num_adr_sup, num_adr_sup_2, 
-        way_type, way_link, street_name, cardinal_pt, apt_num, apt_num_1, apt_num_2, mat18, cubf, 
-        file_num, nghbr_unit, owner_date, owner_type, owner_status, lot_lin_dim, lot_area, max_floors, 
-        const_yr, const_yr_real, floor_area, phys_link, const_type, num_dwelling, num_rental, num_non_res, 
-        apprais_date, lot_value, building_value, value, prev_value) VALUES %s ON CONFLICT DO NOTHING""", 
+        street_name, apt_num, apt_num_1, apt_num_2, mat18, cubf, file_num, nghbr_unit, owner_date, owner_type, 
+        owner_status, lot_lin_dim, lot_area, max_floors, const_yr, const_yr_real, floor_area, phys_link, 
+        const_type, num_dwelling, num_rental, num_non_res, apprais_date, lot_value, building_value, value,
+        prev_value) VALUES %s ON CONFLICT DO NOTHING""", 
         current_units, template=template)
 
 
@@ -279,7 +323,12 @@ def extract_field_or_empty_string(unit_xml, field_id):
             
 
 def get_address_components_and_resolve(rl0101x, unit_data):
-    """Add all address subfields and the fully resolved address to unit_data"""
+    """
+    Add address subfields and fully resolved address to unit_data
+    I opted not to include the unresolved way link, type and cardinal points
+    as they were not very interesting by themselves, instead keeping
+    a nicely formatted address and street name fields containing the info
+    """
     address_components = []
 
     if num_adr_inf := rl0101x.find('rl0101ax'):
@@ -296,6 +345,7 @@ def get_address_components_and_resolve(rl0101x, unit_data):
 
     if num_adr_sup := rl0101x.find('rl0101cx'):
         unit_data['num_adr_sup'] = num_adr_sup.text
+        address_components.append('-')
         address_components.append(num_adr_sup.text)
     else:
         unit_data['num_adr_sup'] = None
@@ -306,31 +356,31 @@ def get_address_components_and_resolve(rl0101x, unit_data):
     else:
         unit_data['num_adr_sup_2'] = None
 
+    # Process the street name
+    street_components = []
     if way_type := rl0101x.find('rl0101ex'):
-        unit_data['way_type'] = way_type.text
-        address_components.append(WAY_TYPES[way_type.text])
-    else:
-        unit_data['way_type'] = None
+        # Resolve the way type
+        way_type = WAY_TYPES[way_type.text]
+        address_components.append(way_type)
+        street_components.append(way_type)
 
     if way_link := rl0101x.find('rl0101fx'):
-        unit_data['way_link'] = way_link.text
-        address_components.append(WAY_LINKS[way_link.text])
-    else:
-        unit_data['way_link'] = None
+        way_link = WAY_LINKS[way_link.text]
+        address_components.append(way_link)
+        street_components.append(way_link)
 
     if street_name := rl0101x.find('rl0101gx'):
-        unit_data['street_name'] = street_name.text
-        address_components.append(street_name.text)
-    else:
-        unit_data['street_name'] = None
+        street_name = street_name.text
+        address_components.append(street_name)
+        street_components.append(street_name)
 
     if cardinal_pt := rl0101x.find('rl0101hx'):
-        unit_data['cardinal_pt'] = cardinal_pt.text
-        address_components.append(CARDINAL_POINTS[cardinal_pt.text])
-    else:
-        unit_data['cardinal_pt'] = None
+        cardinal_pt = CARDINAL_POINTS[cardinal_pt.text]
+        address_components.append(cardinal_pt)
+        street_components.append(cardinal_pt)
 
-    unit_data['address'] = " ".join(address_components)
+    unit_data['street_name'] = " ".join(street_components).title()
+    unit_data['address'] = " ".join(address_components).title()
 
 
 def get_apt_num_components(rl0101x, unit_data):
@@ -398,10 +448,7 @@ def create_tables_if_not_exists():
             num_adr_inf_2 TEXT,
             num_adr_sup TEXT,
             num_adr_sup_2 TEXT,
-            way_type TEXT,
-            way_link TEXT,
             street_name TEXT,
-            cardinal_pt TEXT,
             apt_num TEXT,
             apt_num_1 TEXT,
             apt_num_2 TEXT,

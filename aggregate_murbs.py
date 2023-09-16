@@ -9,26 +9,24 @@ from psycopg2.extras import execute_values
 DB_CONFIG = dotenv_values(".env")
 
 SQL_COPY_TEMPLATE = """(%(id)s, %(lat)s, %(lng)s, %(year)s, %(muni)s, %(muni_code)s, %(arrond)s, %(address)s, 
-    %(num_adr_inf)s, %(num_adr_inf_2)s, %(num_adr_sup)s, %(num_adr_sup_2)s, %(way_type)s, %(way_link)s, 
-    %(street_name)s, %(cardinal_pt)s, %(apt_num)s, %(apt_num_1)s, %(apt_num_2)s, %(mat18)s, %(cubf)s, 
-    %(file_num)s, %(nghbr_unit)s, %(owner_date)s, %(owner_type)s, %(owner_status)s, %(lot_lin_dim)s, 
-    %(lot_area)s, %(max_floors)s, %(const_yr)s, %(const_yr_real)s, %(floor_area)s, %(phys_link)s, 
-    %(const_type)s, %(num_dwelling)s, %(num_rental)s, %(num_non_res)s, %(apprais_date)s, %(lot_value)s, 
-    %(building_value)s, %(value)s, %(prev_value)s)"""
+    %(num_adr_inf)s, %(num_adr_inf_2)s, %(num_adr_sup)s, %(num_adr_sup_2)s, %(street_name)s, %(apt_num)s, 
+    %(apt_num_1)s, %(apt_num_2)s, %(mat18)s, %(cubf)s, %(file_num)s, %(nghbr_unit)s, %(owner_date)s, 
+    %(owner_type)s, %(owner_status)s, %(lot_lin_dim)s, %(lot_area)s, %(max_floors)s, %(const_yr)s, 
+    %(const_yr_real)s, %(floor_area)s, %(phys_link)s, %(const_type)s, %(num_dwelling)s, %(num_rental)s, 
+    %(num_non_res)s, %(apprais_date)s, %(lot_value)s, %(building_value)s, %(value)s, %(prev_value)s)"""
 
 SQL_COPY_DUPLICATES_TO_OTHER_TABLE = f"""INSERT INTO {DB_CONFIG['MURB_DISAG_TABLE_NAME']}
     (id, lat, lng, year, muni, muni_code, arrond, address, num_adr_inf, num_adr_inf_2, num_adr_sup, num_adr_sup_2, 
-    way_type, way_link, street_name, cardinal_pt, apt_num, apt_num_1, apt_num_2, mat18, cubf, 
-    file_num, nghbr_unit, owner_date, owner_type, owner_status, lot_lin_dim, lot_area, max_floors, 
-    const_yr, const_yr_real, floor_area, phys_link, const_type, num_dwelling, num_rental, num_non_res, 
-    apprais_date, lot_value, building_value, value, prev_value) VALUES %s ON CONFLICT DO NOTHING"""
+    street_name, apt_num, apt_num_1, apt_num_2, mat18, cubf, file_num, nghbr_unit, owner_date, owner_type, 
+    owner_status, lot_lin_dim, lot_area, max_floors, const_yr, const_yr_real, floor_area, phys_link, const_type, 
+    num_dwelling, num_rental, num_non_res, apprais_date, lot_value, building_value, value, prev_value) VALUES %s ON CONFLICT DO NOTHING"""
 
 SQL_INSERT_AGGREGATED_MURB = f"""INSERT INTO {DB_CONFIG['ROLL_TABLE_NAME']}
-        (id, lat, lng, year, muni, muni_code, arrond, address, mat18, cubf, nghbr_unit, owner_date, owner_type, owner_status, 
+        (id, lat, lng, year, muni, muni_code, arrond, address, street_name, mat18, cubf, nghbr_unit, owner_date, owner_type, owner_status, 
         lot_lin_dim, lot_area, max_floors, const_yr, const_yr_real, floor_area, phys_link, const_type, num_dwelling, 
         num_rental, num_non_res, apprais_date, lot_value, building_value, value, prev_value) 
     VALUES
-        (%(id)s, %(lat)s, %(lng)s, %(year)s, %(muni)s, %(muni_code)s, %(arrond)s, %(address)s, %(mat18)s, %(cubf)s, %(nghbr_unit)s, 
+        (%(id)s, %(lat)s, %(lng)s, %(year)s, %(muni)s, %(muni_code)s, %(arrond)s, %(address)s, %(street_name)s, %(mat18)s, %(cubf)s, %(nghbr_unit)s, 
         %(owner_date)s, %(owner_type)s, %(owner_status)s, %(lot_lin_dim)s, %(lot_area)s, %(max_floors)s, 
         %(const_yr)s, %(const_yr_real)s, %(floor_area)s, %(phys_link)s, %(const_type)s, %(num_dwelling)s, 
         %(num_rental)s, %(num_non_res)s, %(apprais_date)s, %(lot_value)s, %(building_value)s, %(value)s, 
@@ -156,10 +154,7 @@ def aggregate_murbs():
             'num_adr_inf_2': dupe['num_adr_inf_2'],
             'num_adr_sup': dupe['num_adr_sup'],
             'num_adr_sup_2': dupe['num_adr_sup_2'],
-            'way_type': dupe['way_type'],
-            'way_link': dupe['way_link'],
             'street_name': dupe['street_name'],
-            'cardinal_pt': dupe['cardinal_pt'],
             'apt_num': dupe['apt_num'],
             'apt_num_1': dupe['apt_num_1'],
             'apt_num_2': dupe['apt_num_2'],
@@ -300,10 +295,7 @@ def create_disaggrregated_MURBs_table_if_not_exists():
             num_adr_inf_2 TEXT,
             num_adr_sup TEXT,
             num_adr_sup_2 TEXT,
-            way_type TEXT,
-            way_link TEXT,
             street_name TEXT,
-            cardinal_pt TEXT,
             apt_num TEXT,
             apt_num_1 TEXT,
             apt_num_2 TEXT,
